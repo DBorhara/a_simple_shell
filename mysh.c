@@ -178,4 +178,9 @@ void print_curr_dir(void)
     free(cwd);
 }
 
-
+void process_command(char *command)
+{
+    int command_len = strlen(command);
+    write(STDOUT_FILENO, command, command_len);
+    write(STDOUT_FILENO, "\n", 1);
+}
