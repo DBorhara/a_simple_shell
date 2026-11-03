@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 void print_curr_dir(void);
 void process_command(char *command);
@@ -77,7 +78,7 @@ int main(int argc, char const *argv[])
                 char *temp = realloc(buf, new_buf_capacity);
                 if (temp == NULL)
                 {
-                    perror("realloc");
+                    perror("buf realloc");
                     free(buf);
                     exit(EXIT_FAILURE);
                 }
@@ -118,7 +119,6 @@ void print_curr_dir(void)
     if (cwd == NULL)
     {
         perror("malloc");
-        free(cwd);
         exit(EXIT_FAILURE);
     }
     while (getcwd(cwd, cwd_capacity) == NULL)
@@ -142,7 +142,7 @@ void print_curr_dir(void)
         char *temp = realloc(cwd, new_cwd_capacity);
         if (temp == NULL)
         {
-            perror("realloc");
+            perror("cwd realloc");
             free(cwd);
             exit(EXIT_FAILURE);
         }
@@ -180,7 +180,91 @@ void print_curr_dir(void)
 
 void process_command(char *command)
 {
-    int command_len = strlen(command);
+    size_t command_len = strlen(command);
     write(STDOUT_FILENO, command, command_len);
     write(STDOUT_FILENO, "\n", 1);
+    size_t tokens_capacity = 10;
+    char **tokens = malloc(tokens_capacity * sizeof(*tokens));
+    if (tokens == NULL)
+    {
+        perror("tokens");
+        exit(EXIT_FAILURE);
+    }
+    size_t tokens_len = 0;
+    size_t i = 0;
+
+    while (i < command_len)
+    {
+        // Skip whitespace in the beginning
+        while (command[i] != '\0' && isspace(command[i]))
+        {
+            i++;
+        }
+        // '\0' string terminator
+        if (command[i] == '\0' ||)
+        {
+            break;
+        }
+        // # comment terminator
+        if (command[i] == '#')
+        {
+            break;
+        }
+
+        char *start = command + i;
+        while (command[i] != '\0' && !isspace(command[i]) && command[i] != '#')
+        {
+            i++;
+        }
+        if (isspace(command[i]))
+        {
+            command[i] = '\0';
+            i++;
+        }
+       
+        if (tokens_len >= tokens_capacity - 1)
+        {
+            if (tokens_capacity > SIZE_MAX / 2)
+            {
+                char msg[] = "Memory overflow in tokens realloc()";
+                write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                free(tokens);
+                exit(EXIT_FAILURE);
+            }
+            size_t new_tokens_capacity = tokens_capacity * 2;
+            if (new_tokens_capacity > SIZE_MAX / sizeof(*tokens))
+            {
+                char msg[] = "Memory overflow in tokens realloc()";
+                write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                free(tokens);
+                exit(EXIT_FAILURE);
+            }
+
+            char **temp = realloc(tokens, new_tokens_capacity * sizeof(*tokens));
+            if (temp == NULL)
+            {
+                perror("tokens realloc");
+                free(tokens);
+                exit(EXIT_FAILURE);
+            }
+            tokens = temp;
+            tokens_capacity = new_tokens_capacity;
+        }
+        tokens[tokens_len] = start;
+        tokens_len++;
+         if (command[i] == '#')
+        {
+            command[i] = '\0';
+            break;
+        }
+    }
+    tokens[tokens_len] = NULL;
+
+    printf("Array elements: ");
+    for (size_t i = 0; i < tokens_len; i++)
+    {
+        printf("%s ", *(tokens + i));
+    }
+    printf("\n");
+    free(tokens);
 }
