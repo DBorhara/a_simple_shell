@@ -6,9 +6,13 @@
 #include <string.h>
 #include <errno.h>
 #include <ctype.h>
+#include <sys/wait.h>
+#include <sys/types.h>
 
-void print_curr_dir(void);
+int print_curr_dir(void);
 int process_command(char *command);
+char *get_current_dir(void);
+char *executable_search(const char *exec);
 
 typedef struct
 {
@@ -38,6 +42,7 @@ int main(int argc, char const *argv[])
         exit(EXIT_FAILURE);
     }
     size_t buf_len = 0;
+    // Batch fd or interactive mode fd
     int fd = STDIN_FILENO;
     // batch mode
     if (argc == 2)
@@ -55,11 +60,38 @@ int main(int argc, char const *argv[])
     if (is_interactive)
     {
         printf("Welcome to my shell!\n");
-        print_curr_dir();
+        last_status = print_curr_dir();
     }
+
+    // read() each character at a time until '\n' or '\0'
     char c;
-    while ((bytes = read(fd, &c, 1)) > 0)
+    while (1)
     {
+        bytes = read(fd, &c, 1);
+
+        if (bytes == -1)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            perror("read");
+            free(buf);
+
+            if (argc == 2)
+            {
+                close(fd);
+            }
+
+            return EXIT_FAILURE;
+        }
+        // end of input
+        if (bytes == 0)
+        {
+            break;
+        }
+        // Replace new linw with string terminator
         if (c == '\n')
         {
             buf[buf_len] = '\0';
@@ -100,13 +132,10 @@ int main(int argc, char const *argv[])
             buf_len++;
         }
     }
-    if (bytes == -1)
-    {
-        perror("read");
-        exit(EXIT_FAILURE);
-    }
+
     if (bytes == 0 && buf_len > 0)
     {
+        buf[buf_len] = '\0';
         last_status = process_command(buf);
         buf_len = 0;
     }
@@ -123,70 +152,35 @@ int main(int argc, char const *argv[])
     return last_status;
 }
 
-void print_curr_dir(void)
+int print_curr_dir(void)
 {
-    size_t cwd_capacity = BUFSIZ;
-    char *cwd = malloc(cwd_capacity);
+    char *cwd = get_current_dir();
+
     if (cwd == NULL)
     {
-        perror("malloc");
-        exit(EXIT_FAILURE);
-    }
-    while (getcwd(cwd, cwd_capacity) == NULL)
-    {
-        if (errno != ERANGE)
-        {
-            perror("getcwd");
-            free(cwd);
-            exit(EXIT_FAILURE);
-        }
-        if (cwd_capacity > SIZE_MAX / 2)
-        {
-            free(cwd);
-            char msg[] = "Memory overflow in realloc()";
-            write(STDERR_FILENO, msg, sizeof(msg) - 1);
-            free(cwd);
-            exit(EXIT_FAILURE);
-        }
-        size_t new_cwd_capacity = cwd_capacity * 2;
-
-        char *temp = realloc(cwd, new_cwd_capacity);
-        if (temp == NULL)
-        {
-            perror("cwd realloc");
-            free(cwd);
-            exit(EXIT_FAILURE);
-        }
-        cwd = temp;
-        cwd_capacity = new_cwd_capacity;
+        perror("pwd");
+        return EXIT_FAILURE;
     }
 
     const char *home = getenv("HOME");
-    if (home == NULL)
-    {
-        char msg[] = "Home directory is NULL";
-        write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        free(cwd);
-        exit(EXIT_FAILURE);
-    }
+    const char *cwd_path = cwd;
 
-    size_t home_len = strlen(home);
-
-    // Inside HOME directory
-    if (strncmp(cwd, home, home_len) == 0 && (cwd[home_len] == '/' || cwd[home_len] == '\0'))
+    if (home != NULL && home[0] != '\0')
     {
-        char *sub_dir_path = cwd + home_len;
+        size_t home_len = strlen(home);
 
-        write(STDOUT_FILENO, "~", 1);
-        write(STDOUT_FILENO, sub_dir_path, strlen(sub_dir_path));
-        write(STDOUT_FILENO, "$ ", 2);
+        if (strncmp(cwd, home, home_len) == 0 && (cwd[home_len] == '/' || cwd[home_len] == '\0'))
+        {
+            write(STDOUT_FILENO, "~", 1);
+            cwd_path = cwd + home_len;
+        }
     }
-    else // Outside HOME directory
-    {
-        write(STDOUT_FILENO, cwd, strlen(cwd));
-        write(STDOUT_FILENO, "$ ", 2);
-    }
+    write(STDOUT_FILENO, cwd_path, strlen(cwd_path));
+    write(STDOUT_FILENO, "$ ", 2);
+
     free(cwd);
+
+    return EXIT_SUCCESS;
 }
 
 int process_command(char *command)
@@ -241,6 +235,7 @@ int process_command(char *command)
                 free(tokens);
                 exit(EXIT_FAILURE);
             }
+
             size_t new_tokens_capacity = tokens_capacity * 2;
             if (new_tokens_capacity > SIZE_MAX / sizeof(*tokens))
             {
@@ -272,76 +267,235 @@ int process_command(char *command)
 
     if (tokens_len > 0)
     {
-        const char *directories[] = {
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin"};
-
-        char path[BUFSIZ];
-        char *exectuable = NULL;
-
-        if (strchr(tokens[0], '/') != NULL)
+        if (strcmp(tokens[0], "cd") == 0)
         {
-            if (access(tokens[0], X_OK) == 0)
+            if (tokens_len > 2)
             {
-                exectuable = tokens[0];
+                char msg[] = "cd: Too many arguments\n";
+                write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                exit_status = EXIT_FAILURE;
+            }
+            else if (tokens_len == 1)
+            {
+                char *home = getenv("HOME");
+                if (home == NULL)
+                {
+                    char msg[] = "cd: No HOME environment set\n";
+                    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                    exit_status = EXIT_FAILURE;
+                }
+                else if (chdir(home) == -1)
+                {
+                    perror("cd");
+                    exit_status = EXIT_FAILURE;
+                }
+            }
+            else
+            {
+                if (chdir(tokens[1]) == -1)
+                {
+                    perror("cd");
+                    exit_status = EXIT_FAILURE;
+                }
+            }
+        }
+        else if (strcmp(tokens[0], "pwd") == 0)
+        {
+            char *cwd = get_current_dir();
+            if (cwd == NULL)
+            {
+                perror("pwd");
+                exit_status = EXIT_FAILURE;
+            }
+            else
+            {
+                write(STDOUT_FILENO, cwd, strlen(cwd));
+                write(STDOUT_FILENO, "\n", 1);
+                free(cwd);
+            }
+        }
+        else if (strcmp(tokens[0], "which") == 0)
+        {
+            if (tokens_len > 2)
+            {
+                fprintf(stderr, "which: too many arguments\n");
+                exit_status = EXIT_FAILURE;
+            }
+            else if (tokens_len < 2)
+            {
+                fprintf(stderr, "which: missing arguments\n");
+                exit_status = EXIT_FAILURE;
+            }
+            else
+            {
+                char *which_arg_path = executable_search(tokens[1]);
+                if (which_arg_path != NULL)
+                {
+                    write(STDOUT_FILENO, which_arg_path, strlen(which_arg_path));
+                    write(STDOUT_FILENO, "\n", 1);
+                    free(which_arg_path);
+                }
+                else
+                {
+                    fprintf(stderr, "which: executable not found: %s\n", tokens[1]);
+                    exit_status = EXIT_FAILURE;
+                }
             }
         }
         else
         {
-            int directories_len = sizeof(directories) / sizeof(directories[0]);
-            for (size_t i = 0; i < directories_len; i++)
+            char *executable = executable_search(tokens[0]);
+            if (executable == NULL)
             {
-                int exe = snprintf(path, sizeof(path), "%s/%s", directories[i], tokens[0]);
-
-                // Too big for buffer
-                if (exe < 0 || (size_t)exe >= sizeof(path))
-                {
-                    continue;
-                }
-                // Found our first executable
-                if (access(path, X_OK) == 0)
-                {
-                    exectuable = path;
-                    break;
-                }
-            }
-        }
-        if (exectuable != NULL)
-        {
-            pid_t c = fork();
-            if (c == 0) // child
-            {
-                execv(exectuable, tokens);
-                perror("execv");
-                // _exit to prevent flushing data waiting in parent memory
-                _exit(EXIT_FAILURE);
-            }
-            else if (c > 0) // parent
-            {
-                int status;
-                if (waitpid(c, &status, 0) == -1) // error
-                {
-                    perror("waitpid");
-                    exit_status = EXIT_FAILURE;
-                }
-                else if (WIFEXITED(status)) // Exit Status
-                {
-                    exit_status = WEXITSTATUS(status);
-                }
-                else if (WIFSIGNALED(status)) // Terminated by a Signal
-                {
-                    exit_status = WTERMSIG(status);
-                }
-            }
-            else // error
-            {
-                perror("fork");
+                fprintf(stderr, "mysh: command not found: %s\n", tokens[0]);
                 exit_status = EXIT_FAILURE;
             }
+            else
+            {
+
+                pid_t c = fork();
+                if (c == 0) // child
+                {
+                    execv(executable, tokens);
+                    perror("execv");
+                    // _exit to prevent flushing data waiting in parent memory
+                    _exit(EXIT_FAILURE);
+                }
+                else if (c > 0) // parent
+                {
+                    int status;
+                    pid_t result = waitpid(c, &status, 0);
+
+                    // Retry if signal occurred while system call wass in progress
+                    while (result == -1 && errno == EINTR)
+                    {
+                        result = waitpid(c, &status, 0);
+                    }
+
+                    if (result == -1) // error
+                    {
+                        perror("waitpid");
+                        exit_status = EXIT_FAILURE;
+                    }
+                    else if (WIFEXITED(status)) // Exit Status
+                    {
+                        exit_status = WEXITSTATUS(status);
+                    }
+                    else if (WIFSIGNALED(status)) // Terminated by a Signal
+                    {
+                        exit_status = WTERMSIG(status);
+                    }
+                }
+                else // error
+                {
+                    perror("fork");
+                    exit_status = EXIT_FAILURE;
+                }
+            }
+            free(executable);
         }
     }
 
     free(tokens);
     return exit_status;
+}
+
+char *get_current_dir(void)
+{
+    size_t cwd_capacity = BUFSIZ;
+    char *cwd = malloc(cwd_capacity);
+    if (cwd == NULL)
+    {
+        return NULL;
+    }
+    while (getcwd(cwd, cwd_capacity) == NULL)
+    {
+        if (errno != ERANGE)
+        {
+            free(cwd);
+            return NULL;
+        }
+        if (cwd_capacity > SIZE_MAX / 2)
+        {
+            free(cwd);
+            errno = ENOMEM;
+            return NULL;
+        }
+        size_t new_cwd_capacity = cwd_capacity * 2;
+
+        char *temp = realloc(cwd, new_cwd_capacity);
+        if (temp == NULL)
+        {
+            free(cwd);
+            return NULL;
+        }
+        cwd = temp;
+        cwd_capacity = new_cwd_capacity;
+    }
+    return cwd;
+}
+
+char *executable_search(const char *exe)
+{
+    const char *directories[] = {
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin"};
+
+    if (strchr(exe, '/') != NULL)
+    {
+        if (access(exe, X_OK) == 0)
+        {
+            size_t exe_size = strlen(exe) + 1;
+            char *path = malloc(exe_size);
+
+            if (path == NULL)
+            {
+                return NULL;
+            }
+
+            memcpy(path, exe, exe_size);
+            return path;
+        }
+    }
+    else
+    {
+        size_t directories_len = sizeof(directories) / sizeof(directories[0]);
+        for (size_t i = 0; i < directories_len; i++)
+        {
+            size_t dir_len = strlen(directories[i]);
+            size_t exe_len = strlen(exe);
+
+            if (exe_len > SIZE_MAX - 2 ||
+                dir_len > SIZE_MAX - exe_len - 2)
+            {
+                errno = ENOMEM;
+                return NULL;
+            }
+            size_t path_size = dir_len + exe_len + 2;
+
+            char *path = malloc(path_size);
+
+            if (path == NULL)
+            {
+                return NULL;
+            }
+            // snprintf(memory where combine goes, size of memory, "str1 to strN to combine", str1 to strN to combine)
+            // returns combined string length
+            int combined_path_len = snprintf(path, path_size, "%s/%s", directories[i], exe);
+            if (combined_path_len < 0 || (size_t)combined_path_len >= path_size)
+            {
+                free(path);
+                continue;
+            }
+            if (access(path, X_OK) == 0)
+            {
+                return path;
+            }
+
+            free(path);
+        }
+        return NULL;
+    }
+    return NULL;
 }
