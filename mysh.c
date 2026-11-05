@@ -9,8 +9,8 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 
-int print_curr_dir(void);
-int process_command(char *command);
+int prepend_dir(void);
+int process_command(char *command, int *should_exit);
 char *get_current_dir(void);
 char *executable_search(const char *exec);
 
@@ -31,7 +31,7 @@ int main(int argc, char const *argv[])
         write(STDERR_FILENO, msg, sizeof(msg) - 1);
         exit(EXIT_FAILURE);
     }
-
+    int should_exit = 0;
     int last_status = 0;
     ssize_t bytes;
     size_t buf_capacity = BUFSIZ;
@@ -60,16 +60,16 @@ int main(int argc, char const *argv[])
     if (is_interactive)
     {
         printf("Welcome to my shell!\n");
-        last_status = print_curr_dir();
+        last_status = prepend_dir();
     }
 
-    // read() each character at a time until '\n' or '\0'
+    // read() each character of a given input one at a time until '\n', '\0', or error
     char c;
     while (1)
     {
         bytes = read(fd, &c, 1);
 
-        if (bytes == -1)
+        if (bytes == -1) // error handling
         {
             if (errno == EINTR)
             {
@@ -86,27 +86,29 @@ int main(int argc, char const *argv[])
 
             return EXIT_FAILURE;
         }
-        // end of input
-        if (bytes == 0)
+        if (bytes == 0) // end of input
         {
             break;
         }
-        // Replace new linw with string terminator
-        if (c == '\n')
+        if (c == '\n') // Replace new line with string terminator and process command
         {
             buf[buf_len] = '\0';
-            last_status = process_command(buf);
+            last_status = process_command(buf, &should_exit);
             buf_len = 0;
+            if (should_exit)
+            {
+                break;
+            }
             if (argc == 1 && isatty(fd))
             {
-                print_curr_dir();
+                prepend_dir();
             }
 
             continue;
         }
-        else
+        else // just process the line
         {
-            if (buf_len >= buf_capacity - 1)
+            if (buf_len >= buf_capacity - 1) // not enough space in buffer
             {
                 if (buf_capacity > SIZE_MAX / 2)
                 {
@@ -128,31 +130,43 @@ int main(int argc, char const *argv[])
                 buf_capacity = new_buf_capacity;
             }
 
-            buf[buf_len] = c;
+            buf[buf_len] = c; // write to buffer
             buf_len++;
         }
     }
 
-    if (bytes == 0 && buf_len > 0)
+    if (bytes == 0 && buf_len > 0) // EOF
     {
         buf[buf_len] = '\0';
-        last_status = process_command(buf);
+        last_status = process_command(buf, &should_exit);
         buf_len = 0;
     }
+
+    // Clean Up
     free(buf);
     if (argc == 2)
     {
         close(fd);
     }
+
+    // interactive "good bye"
     if (is_interactive)
     {
-        char msg[] = "\nGoodbye from my shell";
-        write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+        if (should_exit)
+        {
+            char msg[] = "Goodbye from my shell";
+            write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+        }
+        else
+        {
+            char msg[] = "\nGoodbye from my shell";
+            write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+        }
     }
     return last_status;
 }
 
-int print_curr_dir(void)
+int prepend_dir(void)
 {
     char *cwd = get_current_dir();
 
@@ -183,7 +197,7 @@ int print_curr_dir(void)
     return EXIT_SUCCESS;
 }
 
-int process_command(char *command)
+int process_command(char *command, int *should_exit)
 {
     int exit_status = 0;
     size_t command_len = strlen(command);
@@ -267,7 +281,7 @@ int process_command(char *command)
 
     if (tokens_len > 0)
     {
-        if (strcmp(tokens[0], "cd") == 0)
+        if (strcmp(tokens[0], "cd") == 0) // cd
         {
             if (tokens_len > 2)
             {
@@ -299,7 +313,7 @@ int process_command(char *command)
                 }
             }
         }
-        else if (strcmp(tokens[0], "pwd") == 0)
+        else if (strcmp(tokens[0], "pwd") == 0) // pwd
         {
             char *cwd = get_current_dir();
             if (cwd == NULL)
@@ -314,7 +328,7 @@ int process_command(char *command)
                 free(cwd);
             }
         }
-        else if (strcmp(tokens[0], "which") == 0)
+        else if (strcmp(tokens[0], "which") == 0) // which
         {
             if (tokens_len > 2)
             {
@@ -342,6 +356,19 @@ int process_command(char *command)
                 }
             }
         }
+        else if (strcmp(tokens[0], "exit") == 0) // exit
+        {
+            if (tokens_len > 1)
+            {
+                fprintf(stderr, "exit: Too many arguments.\n");
+                exit_status = EXIT_FAILURE;
+            }
+            else
+            {
+                *should_exit = 1;
+            }
+        }
+
         else
         {
             char *executable = executable_search(tokens[0]);
