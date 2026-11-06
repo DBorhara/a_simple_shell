@@ -1,8 +1,8 @@
 CC = gcc
-CFLAGS = -std=c99 -g -Wall -fsanitize=address -fsanitize=undefined -Wextra
+CFLAGS = -std=c99 -g -Wall -Wpedantic -fsanitize=address,undefined -Wextra
 
-mysh: mysh.c
+mysh: mysh.c mysh.h
 	$(CC) $(CFLAGS) mysh.c -o mysh
 
 clean: 
-	rm -f mysh
+	rm -f mysh *.txt

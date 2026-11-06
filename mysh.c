@@ -8,20 +8,7 @@
 #include <ctype.h>
 #include <sys/wait.h>
 #include <sys/types.h>
-
-int prepend_dir(void);
-int process_command(char *command, int *should_exit);
-char *get_current_dir(void);
-char *executable_search(const char *exec);
-
-typedef struct
-{
-    char **args;
-    size_t argc;
-    char *input_file;
-    char *output_file;
-    int append;
-} Command;
+#include "mysh.h"
 
 int main(int argc, char const *argv[])
 {
@@ -200,19 +187,23 @@ int prepend_dir(void)
 int process_command(char *command, int *should_exit)
 {
     int exit_status = 0;
+    int expect_input = 0;
+    int expect_output = 0;
     size_t command_len = strlen(command);
-    size_t tokens_capacity = 10;
-    char **tokens = malloc(tokens_capacity * sizeof(*tokens));
-    if (tokens == NULL)
+    Command cmd = {0};
+    size_t args_capacity = 10;
+    cmd.args = malloc(args_capacity * sizeof(*cmd.args));
+    if (cmd.args == NULL)
     {
-        perror("tokens");
-        exit(EXIT_FAILURE);
+        perror("malloc");
+        return EXIT_FAILURE;
     }
-    size_t tokens_len = 0;
+
     size_t i = 0;
 
-    while (i < command_len)
+    while (i < command_len) // tokenization
     {
+        // Special Cases
         // Skip whitespace in the beginning
         while (command[i] != '\0' && isspace(command[i]))
         {
@@ -240,56 +231,98 @@ int process_command(char *command, int *should_exit)
             i++;
         }
 
-        if (tokens_len >= tokens_capacity - 1)
+        if (cmd.argc >= args_capacity - 1)
         {
-            if (tokens_capacity > SIZE_MAX / 2)
+            if (args_capacity > SIZE_MAX / 2)
             {
-                char msg[] = "Memory overflow in tokens realloc()";
+                char msg[] = "Memory overflow in realloc()";
                 write(STDERR_FILENO, msg, sizeof(msg) - 1);
-                free(tokens);
+                free(cmd.args);
                 exit(EXIT_FAILURE);
             }
 
-            size_t new_tokens_capacity = tokens_capacity * 2;
-            if (new_tokens_capacity > SIZE_MAX / sizeof(*tokens))
+            size_t new_args_capacity = args_capacity * 2;
+            if (new_args_capacity > SIZE_MAX / sizeof(*cmd.args))
             {
-                char msg[] = "Memory overflow in tokens realloc()";
+                char msg[] = "Memory overflow in realloc()";
                 write(STDERR_FILENO, msg, sizeof(msg) - 1);
-                free(tokens);
+                free(cmd.args);
                 exit(EXIT_FAILURE);
             }
 
-            char **temp = realloc(tokens, new_tokens_capacity * sizeof(*tokens));
+            char **temp = realloc(cmd.args, new_args_capacity * sizeof(*cmd.args));
             if (temp == NULL)
             {
-                perror("tokens realloc");
-                free(tokens);
+                perror("realloc()");
+                free(cmd.args);
                 exit(EXIT_FAILURE);
             }
-            tokens = temp;
-            tokens_capacity = new_tokens_capacity;
+            cmd.args = temp;
+            args_capacity = new_args_capacity;
         }
-        tokens[tokens_len] = start;
-        tokens_len++;
+        int is_redirect_operator = strcmp(start, ">") == 0 || strcmp(start, ">>") == 0 || strcmp(start, "<") == 0;
+        if ((expect_input || expect_output) && is_redirect_operator)
+        {
+            fprintf(stderr, "Expected filename before operator\n");
+            exit_status = EXIT_FAILURE;
+            break;
+        }
+        if (expect_output)
+        {
+            cmd.output_file = start;
+            expect_output = 0;
+        }
+        else if (strcmp(start, ">") == 0)
+        {
+            expect_output = 1;
+            cmd.append = 0;
+        }
+        else if (strcmp(start, ">>") == 0)
+        {
+            expect_output = 1;
+            cmd.append = 1;
+        }
+        else if (expect_input)
+        {
+            cmd.input_file = start;
+            expect_input = 0;
+        }
+        else if (strcmp(start, "<") == 0)
+        {
+            expect_input = 1;
+        }
+        else
+        {
+            cmd.args[cmd.argc] = start;
+            cmd.argc++;
+        }
+
         if (command[i] == '#')
         {
             command[i] = '\0';
             break;
         }
     }
-    tokens[tokens_len] = NULL;
 
-    if (tokens_len > 0)
+    cmd.args[cmd.argc] = NULL; // NULL for execv()
+
+    if (exit_status == EXIT_SUCCESS && (expect_input || expect_output))
     {
-        if (strcmp(tokens[0], "cd") == 0) // cd
+        fprintf(stderr, "Missing redirection filename\n");
+        exit_status = EXIT_FAILURE;
+    }
+
+    if (exit_status == EXIT_SUCCESS && cmd.argc > 0)
+    {
+        if (strcmp(cmd.args[0], "cd") == 0) // cd
         {
-            if (tokens_len > 2)
+            if (cmd.argc > 2)
             {
                 char msg[] = "cd: Too many arguments\n";
                 write(STDERR_FILENO, msg, sizeof(msg) - 1);
                 exit_status = EXIT_FAILURE;
             }
-            else if (tokens_len == 1)
+            else if (cmd.argc == 1)
             {
                 char *home = getenv("HOME");
                 if (home == NULL)
@@ -306,14 +339,14 @@ int process_command(char *command, int *should_exit)
             }
             else
             {
-                if (chdir(tokens[1]) == -1)
+                if (chdir(cmd.args[1]) == -1)
                 {
                     perror("cd");
                     exit_status = EXIT_FAILURE;
                 }
             }
         }
-        else if (strcmp(tokens[0], "pwd") == 0) // pwd
+        else if (strcmp(cmd.args[0], "pwd") == 0) // pwd
         {
             char *cwd = get_current_dir();
             if (cwd == NULL)
@@ -328,21 +361,21 @@ int process_command(char *command, int *should_exit)
                 free(cwd);
             }
         }
-        else if (strcmp(tokens[0], "which") == 0) // which
+        else if (strcmp(cmd.args[0], "which") == 0) // which
         {
-            if (tokens_len > 2)
+            if (cmd.argc > 2)
             {
                 fprintf(stderr, "which: too many arguments\n");
                 exit_status = EXIT_FAILURE;
             }
-            else if (tokens_len < 2)
+            else if (cmd.argc < 2)
             {
                 fprintf(stderr, "which: missing arguments\n");
                 exit_status = EXIT_FAILURE;
             }
             else
             {
-                char *which_arg_path = executable_search(tokens[1]);
+                char *which_arg_path = executable_search(cmd.args[1]);
                 if (which_arg_path != NULL)
                 {
                     write(STDOUT_FILENO, which_arg_path, strlen(which_arg_path));
@@ -351,14 +384,14 @@ int process_command(char *command, int *should_exit)
                 }
                 else
                 {
-                    fprintf(stderr, "which: executable not found: %s\n", tokens[1]);
+                    fprintf(stderr, "which: executable not found: %s\n", cmd.args[1]);
                     exit_status = EXIT_FAILURE;
                 }
             }
         }
-        else if (strcmp(tokens[0], "exit") == 0) // exit
+        else if (strcmp(cmd.args[0], "exit") == 0) // exit
         {
-            if (tokens_len > 1)
+            if (cmd.argc > 1)
             {
                 fprintf(stderr, "exit: Too many arguments.\n");
                 exit_status = EXIT_FAILURE;
@@ -368,13 +401,12 @@ int process_command(char *command, int *should_exit)
                 *should_exit = 1;
             }
         }
-
         else
         {
-            char *executable = executable_search(tokens[0]);
+            char *executable = executable_search(cmd.args[0]);
             if (executable == NULL)
             {
-                fprintf(stderr, "mysh: command not found: %s\n", tokens[0]);
+                fprintf(stderr, "mysh: command not found: %s\n", cmd.args[0]);
                 exit_status = EXIT_FAILURE;
             }
             else
@@ -383,7 +415,51 @@ int process_command(char *command, int *should_exit)
                 pid_t c = fork();
                 if (c == 0) // child
                 {
-                    execv(executable, tokens);
+                    int fd;
+                    if (cmd.output_file != NULL)
+                    {
+                        int flags;
+                        if (cmd.append)
+                        {
+                            flags = O_WRONLY | O_CREAT | O_APPEND;
+                        }
+                        else
+                        {
+                            flags = O_WRONLY | O_CREAT | O_TRUNC;
+                        }
+                        fd = open(cmd.output_file, flags, 0600);
+
+                        if (fd < 0)
+                        {
+                            perror("open");
+                            _exit(EXIT_FAILURE);
+                        }
+                        if (dup2(fd, STDOUT_FILENO) == -1)
+                        {
+                            perror("dup2");
+                            close(fd);
+                            _exit(EXIT_FAILURE);
+                        }
+                        close(fd);
+                    }
+                    if (cmd.input_file != NULL)
+                    {
+                        int fd = open(cmd.input_file, O_RDONLY);
+                        if (fd < 0)
+                        {
+                            perror("open");
+                            _exit(EXIT_FAILURE);
+                        }
+                        if (dup2(fd, STDIN_FILENO) == -1)
+                        {
+                            perror("dup2");
+                            close(fd);
+                            _exit(EXIT_FAILURE);
+                        }
+                        close(fd);
+                    }
+
+                    execv(executable, cmd.args);
                     perror("execv");
                     // _exit to prevent flushing data waiting in parent memory
                     _exit(EXIT_FAILURE);
@@ -423,7 +499,7 @@ int process_command(char *command, int *should_exit)
         }
     }
 
-    free(tokens);
+    free(cmd.args);
     return exit_status;
 }
 
