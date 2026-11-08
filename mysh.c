@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <glob.h>
 
 int main(int argc, char const *argv[])
 { // {{{
@@ -193,14 +194,29 @@ int process_command(char *command, int *should_exit)
   int expect_input = 0;
   int expect_output = 0;
   int has_pipe = 0;
+  glob_t glob_results = {0};
+  int has_glob_results = 0;
   size_t command_len = strlen(command);
-  Command commands[2] = {0};
+
+  size_t commands_capacity = 2;
+  size_t commands_count = 1;
+
+  Command *commands = calloc(commands_capacity, sizeof(*commands));
+
+  if (commands == NULL)
+  {
+    perror("calloc");
+    return EXIT_FAILURE;
+  }
+
   Command *current = &commands[0];
+
   size_t args_capacity = 10;
   current->args = malloc(args_capacity * sizeof(*current->args));
   if (current->args == NULL)
   {
     perror("malloc");
+    free(commands);
     return EXIT_FAILURE;
   }
 
@@ -306,25 +322,48 @@ int process_command(char *command, int *should_exit)
     }
     else if (strcmp(start, "|") == 0)
     {
-      if (has_pipe || current->argc == 0 || expect_input || expect_output)
+      if (current->argc == 0 || expect_input || expect_output)
       {
         fprintf(stderr, "Invalid pipe\n");
         exit_status = EXIT_FAILURE;
         break;
       }
 
-      char **args = malloc(args_capacity * sizeof(*args));
-      if (args == NULL)
+      current->args[current->argc] = NULL;
+      if (commands_capacity <= commands_count)
       {
-        perror("mallc");
+        if (commands_capacity > SIZE_MAX / 2 || commands_capacity * 2 > SIZE_MAX / sizeof(*commands))
+        {
+          fprintf(stderr, "Command array is too large\n");
+          exit_status = EXIT_FAILURE;
+          break;
+        }
+
+        size_t new_capacity = commands_capacity * 2;
+        Command *temp = realloc(commands, new_capacity * sizeof(*commands));
+        if (temp == NULL)
+        {
+          perror("realloc");
+          exit_status = EXIT_FAILURE;
+          break;
+        }
+        commands = temp;
+        commands_capacity = new_capacity;
+      }
+
+      commands[commands_count] = (Command){0};
+      size_t new_args_capcity = 10;
+      commands[commands_count].args = malloc(new_args_capcity * sizeof(*commands[commands_count].args));
+      if (commands[commands_count].args == NULL)
+      {
+        perror("malloc");
         exit_status = EXIT_FAILURE;
         break;
       }
 
-      current->args[current->argc] = NULL;
-
-      commands[1].args = args;
-      current = &commands[1];
+      current = &commands[commands_count];
+      commands_count++;
+      args_capacity = new_args_capcity;
       has_pipe = 1;
     }
     else if (expect_input)
@@ -335,6 +374,53 @@ int process_command(char *command, int *should_exit)
     else if (strcmp(start, "<") == 0)
     {
       expect_input = 1;
+    }
+    else if (strchr(start, '*') != NULL)
+    {
+      size_t glob_count = glob_results.gl_pathc;
+      int flags = 0;
+      if (has_glob_results)
+      {
+        flags = GLOB_APPEND;
+      }
+
+      int result = glob(start, flags, NULL, &glob_results);
+
+      if (result == 0)
+      {
+        has_glob_results = 1;
+
+        for (size_t j = glob_count; j < glob_results.gl_pathc; j++)
+        {
+          if (current->argc >= args_capacity - 1)
+          {
+            size_t new_capacity = args_capacity * 2;
+            char **temp = realloc(current->args, new_capacity * sizeof(*current->args));
+
+            if (temp == NULL)
+            {
+              perror("realloc");
+              exit_status = EXIT_FAILURE;
+              break;
+            }
+            current->args = temp;
+            args_capacity = new_capacity;
+          }
+
+          current->args[current->argc] = glob_results.gl_pathv[j];
+          current->argc++;
+        }
+      }
+      else if (result == GLOB_NOMATCH)
+      {
+        current->args[current->argc] = start;
+        current->argc++;
+      }
+      else
+      {
+        fprintf(stderr, "mysh: glob failed\n");
+        exit_status = EXIT_FAILURE;
+      }
     }
     else
     {
@@ -475,7 +561,7 @@ int process_command(char *command, int *should_exit)
               flags = O_WRONLY | O_CREAT | O_TRUNC;
             }
 
-            int fd = open(commands[1].output_file, flags, 0600);
+            int fd = open(commands[1].output_file, flags, 0640);
 
             if (fd == -1)
             {
@@ -489,6 +575,7 @@ int process_command(char *command, int *should_exit)
               close(fd);
               _exit(EXIT_FAILURE);
             }
+            close(fd);
           }
 
           char *path = executable_search(commands[1].args[0]);
@@ -662,7 +749,7 @@ int process_command(char *command, int *should_exit)
             {
               flags = O_WRONLY | O_CREAT | O_TRUNC;
             }
-            fd = open(current->output_file, flags, 0600);
+            fd = open(current->output_file, flags, 0640);
 
             if (fd < 0)
             {
@@ -733,9 +820,15 @@ int process_command(char *command, int *should_exit)
       free(executable);
     }
   }
+  // Clean up
+  globfree(&glob_results);
+  for (size_t j = 0; j < commands_count; j++)
+  {
+    free(commands[j].args);
+  }
 
-  free(commands[0].args);
-  free(commands[1].args);
+  free(commands);
+
   return exit_status;
 }
 
@@ -772,7 +865,7 @@ char *get_current_dir(void)
     cwd_capacity = new_cwd_capacity;
   }
   return cwd;
-} // }}}
+}
 
 char *executable_search(const char *exe)
 { // {{{
