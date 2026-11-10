@@ -5,4 +5,4 @@ mysh: mysh.c mysh.h
 	$(CC) $(CFLAGS) mysh.c -o mysh
 
 clean:
-	rm -f mysh *.txt
+	rm -f mysh

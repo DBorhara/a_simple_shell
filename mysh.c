@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "mysh.h"
 #include <ctype.h>
 #include <errno.h>
@@ -10,9 +12,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <glob.h>
+#include <signal.h>
 
 int main(int argc, char const *argv[])
-{ // {{{
+{
   if (argc > 2)
   {
     char msg[] = "No more than 1 argument allowed.\n";
@@ -20,7 +23,6 @@ int main(int argc, char const *argv[])
     exit(EXIT_FAILURE);
   }
   int should_exit = 0;
-  int last_status = 0;
   ssize_t bytes;
   size_t buf_capacity = BUFSIZ;
   char *buf = malloc(buf_capacity);
@@ -32,6 +34,8 @@ int main(int argc, char const *argv[])
   size_t buf_len = 0;
   // Batch fd or interactive mode fd
   int fd = STDIN_FILENO;
+  int is_interactive = (argc == 1 && isatty(fd));
+  int batch_mode = !is_interactive;
   // batch mode
   if (argc == 2)
   {
@@ -44,11 +48,10 @@ int main(int argc, char const *argv[])
     }
   }
   // interactive mode
-  int is_interactive = (argc == 1 && isatty(fd));
   if (is_interactive)
   {
     printf("Welcome to my shell!\n");
-    last_status = prepend_dir();
+    prepend_dir();
   }
 
   // read() each character of a given input one at a time until '\n', '\0', or
@@ -79,21 +82,27 @@ int main(int argc, char const *argv[])
     {
       break;
     }
-    if (c ==
-        '\n') // Replace new line with string terminator and process command
+    if (c == '\n') // Replace new line with string terminator and process command
     {
       buf[buf_len] = '\0';
-      last_status = process_command(buf, &should_exit);
+      int signal_number = 0;
+
+      int command_status = process_command(buf, &should_exit, batch_mode, &signal_number);
+
       buf_len = 0;
+
+      if (is_interactive)
+      {
+        report_command_status(command_status, signal_number);
+      }
       if (should_exit)
       {
         break;
       }
-      if (argc == 1 && isatty(fd))
+      if (is_interactive)
       {
         prepend_dir();
       }
-
       continue;
     }
     else // just process the line
@@ -128,7 +137,14 @@ int main(int argc, char const *argv[])
   if (bytes == 0 && buf_len > 0) // EOF
   {
     buf[buf_len] = '\0';
-    last_status = process_command(buf, &should_exit);
+    int signal_number = 0;
+    int command_status = process_command(buf, &should_exit, batch_mode, &signal_number);
+
+    if (is_interactive)
+    {
+      report_command_status(command_status, signal_number);
+    }
+
     buf_len = 0;
   }
 
@@ -144,20 +160,32 @@ int main(int argc, char const *argv[])
   {
     if (should_exit)
     {
-      char msg[] = "Goodbye from my shell";
+      char msg[] = "Goodbye from my shell\n";
       write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     }
     else
     {
-      char msg[] = "\nGoodbye from my shell";
+      char msg[] = "\nGoodbye from my shell\n";
       write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     }
   }
-  return last_status;
-} // }}}
+  return EXIT_SUCCESS;
+}
+
+void report_command_status(int status, int signal_number)
+{
+  if (signal_number != 0)
+  {
+    fprintf(stderr, "Terminated by signal number: %d (%s)\n", signal_number, strsignal(signal_number));
+  }
+  else if (status != EXIT_SUCCESS)
+  {
+    fprintf(stderr, "Exited with status: %d\n", status);
+  }
+}
 
 int prepend_dir(void)
-{ // {{{
+{
   char *cwd = get_current_dir();
 
   if (cwd == NULL)
@@ -188,8 +216,9 @@ int prepend_dir(void)
   return EXIT_SUCCESS;
 } // }}}
 
-int process_command(char *command, int *should_exit)
+int process_command(char *command, int *should_exit, int batch_mode, int *signal_number)
 {
+  *signal_number = 0;
   int exit_status = 0;
   int expect_input = 0;
   int expect_output = 0;
@@ -349,6 +378,7 @@ int process_command(char *command, int *should_exit)
         }
         commands = temp;
         commands_capacity = new_capacity;
+        current = &commands[commands_count - 1];
       }
 
       commands[commands_count] = (Command){0};
@@ -394,8 +424,15 @@ int process_command(char *command, int *should_exit)
         {
           if (current->argc >= args_capacity - 1)
           {
-            size_t new_capacity = args_capacity * 2;
-            char **temp = realloc(current->args, new_capacity * sizeof(*current->args));
+            size_t new_args_capacity = args_capacity * 2;
+            if (new_args_capacity > SIZE_MAX / sizeof(*current->args))
+            {
+              char msg[] = "Memory overflow in realloc()";
+              write(STDERR_FILENO, msg, sizeof(msg) - 1);
+              free(current->args);
+              exit(EXIT_FAILURE);
+            }
+            char **temp = realloc(current->args, new_args_capacity * sizeof(*current->args));
 
             if (temp == NULL)
             {
@@ -404,11 +441,19 @@ int process_command(char *command, int *should_exit)
               break;
             }
             current->args = temp;
-            args_capacity = new_capacity;
+            args_capacity = new_args_capacity;
+          }
+          if (exit_status != EXIT_SUCCESS)
+          {
+            break;
           }
 
           current->args[current->argc] = glob_results.gl_pathv[j];
           current->argc++;
+        }
+        if (exit_status != EXIT_SUCCESS)
+        {
+          break;
         }
       }
       else if (result == GLOB_NOMATCH)
@@ -443,7 +488,7 @@ int process_command(char *command, int *should_exit)
     exit_status = EXIT_FAILURE;
   }
 
-  if (exit_status == EXIT_SUCCESS && has_pipe && (commands[0].argc == 0 || commands[1].argc == 0))
+  if (exit_status == EXIT_SUCCESS && has_pipe && (commands[commands_count - 1].argc == 0))
   {
     fprintf(stderr, "Missing command after pipe.\n");
     exit_status = EXIT_FAILURE;
@@ -451,276 +496,316 @@ int process_command(char *command, int *should_exit)
 
   if (exit_status == EXIT_SUCCESS && has_pipe)
   {
-    int pipefd[2];
+    size_t pipe_count = commands_count - 1;
 
-    if (pipe(pipefd) == -1)
+    if (pipe_count > SIZE_MAX / sizeof(int[2]))
     {
-      perror("pipe");
+      fprintf(stderr, "Too many pipes\n");
       exit_status = EXIT_FAILURE;
     }
     else
     {
-      pid_t pid1 = fork();
-      if (pid1 == -1)
+      int (*pipefds)[2] = malloc(pipe_count * sizeof(*pipefds));
+
+      if (pipefds == NULL)
       {
-        perror("fork");
-        close(pipefd[0]);
-        close(pipefd[1]);
+        perror("malloc");
         exit_status = EXIT_FAILURE;
-      }
-      else if (pid1 == 0) // Child 1
-      {
-        if (dup2(pipefd[1], STDOUT_FILENO) == -1)
-        {
-          perror("dup2");
-          close(pipefd[0]);
-          close(pipefd[1]);
-          _exit(EXIT_FAILURE);
-        }
-        close(pipefd[0]);
-        close(pipefd[1]);
-
-        if (commands[0].input_file != NULL)
-        {
-          int fd = open(commands[0].input_file, O_RDONLY);
-
-          if (fd == -1)
-          {
-            perror("open");
-            _exit(EXIT_FAILURE);
-          }
-
-          if (dup2(fd, STDIN_FILENO) == -1)
-          {
-            perror("dup2");
-            close(fd);
-            _exit(EXIT_FAILURE);
-          }
-          close(fd);
-        }
-
-        char *path = executable_search(commands[0].args[0]);
-        if (path == NULL)
-        {
-          fprintf(stderr, "command not found: %s\n", commands[0].args[0]);
-          _exit(EXIT_FAILURE);
-        }
-
-        execv(path, commands[0].args);
-        perror("execv");
-        free(path);
-        _exit(EXIT_FAILURE);
       }
       else
       {
-        pid_t pid2 = fork();
+        size_t created_pipes = 0;
 
-        if (pid2 == -1)
+        for (size_t i = 0; i < pipe_count; i++)
         {
-          perror("fork");
-          close(pipefd[0]);
-          close(pipefd[1]);
+          if (pipe(pipefds[i]) == -1)
+          {
+            perror("pipe");
+            exit_status = EXIT_FAILURE;
+            break;
+          }
+          created_pipes++;
+        }
 
-          // Reap child 1
-          int child1_status;
+        pid_t *pids = NULL;
+        size_t child_counter = 0;
+        if (exit_status == EXIT_SUCCESS)
+        {
+          if (commands_count > SIZE_MAX / sizeof(*pids))
+          {
+            fprintf(stderr, "Too many processes\n");
+            exit_status = EXIT_FAILURE;
+          }
+          else
+          {
+            pids = malloc(commands_count * sizeof(*pids));
+            if (pids == NULL)
+            {
+              perror("malloc");
+              exit_status = EXIT_FAILURE;
+            }
+            else
+            {
+              for (size_t i = 0; i < commands_count; i++) // fork loop for n children
+              {
+                pid_t pid = fork(); // Create children
+
+                if (pid == -1)
+                {
+                  perror("fork");
+                  exit_status = EXIT_FAILURE;
+                  break;
+                }
+                else if (pid == 0) // Check if in children
+                {
+                  if (batch_mode && i == 0 && commands[i].input_file == NULL)
+                  {
+                    int dev_null = open("/dev/null", O_RDONLY);
+                    if (dev_null == -1)
+                    {
+                      perror("open");
+                      _exit(EXIT_FAILURE);
+                    }
+                    if (dup2(dev_null, STDIN_FILENO) == -1)
+                    {
+                      perror("dup2");
+                      close(dev_null);
+                      _exit(EXIT_FAILURE);
+                    }
+                    close(dev_null);
+                  }
+
+                  // Read from the previous pipe
+                  if (i > 0)
+                  {
+                    if (dup2(pipefds[i - 1][0], STDIN_FILENO) == -1)
+                    {
+                      perror("dup2");
+                      _exit(EXIT_FAILURE);
+                    }
+                  }
+                  // Write to the next pipe
+                  if (i < commands_count - 1)
+                  {
+                    if (dup2(pipefds[i][1], STDOUT_FILENO) == -1)
+                    {
+                      perror("dup2");
+                      _exit(EXIT_FAILURE);
+                    }
+                  }
+                  for (size_t j = 0; j < pipe_count; j++)
+                  {
+                    close(pipefds[j][0]);
+                    close(pipefds[j][1]);
+                  }
+
+                  int builtin_status = execute_builtin(&commands[i], should_exit);
+
+                  if (builtin_status != -1)
+                  {
+                    _exit(builtin_status);
+                  }
+
+                  char *path = executable_search(commands[i].args[0]);
+
+                  if (path == NULL)
+                  {
+                    fprintf(stderr, "Command not found: %s\n", commands[i].args[0]);
+                    _exit(EXIT_FAILURE);
+                  }
+
+                  execv(path, commands[i].args);
+
+                  perror("execv");
+                  free(path);
+                  _exit(EXIT_FAILURE);
+                }
+                else // Check if in parent
+                {
+                  pids[child_counter] = pid;
+                  child_counter++;
+                }
+              }
+            }
+          }
+        }
+        for (size_t i = 0; i < created_pipes; i++)
+        {
+          close(pipefds[i][0]);
+          close(pipefds[i][1]);
+        }
+
+        int last_child_status = 0;
+        int wait_failure = 0;
+        for (size_t i = 0; i < child_counter; i++)
+        {
+          int status = 0;
           pid_t result;
+
           do
           {
-            result = waitpid(pid1, &child1_status, 0);
+            result = waitpid(pids[i], &status, 0);
           } while (result == -1 && errno == EINTR);
 
           if (result == -1)
           {
             perror("waitpid");
+            wait_failure = 1;
           }
+          else if (i == commands_count - 1)
+          {
+            last_child_status = status;
+          }
+        }
+        int pipeline_complete = (exit_status == EXIT_SUCCESS &&
+                                 child_counter == commands_count &&
+                                 !wait_failure);
 
+        if (wait_failure)
+        {
           exit_status = EXIT_FAILURE;
         }
-        else if (pid2 == 0) // Child 2
+        else if (pipeline_complete)
         {
-          if (dup2(pipefd[0], STDIN_FILENO) == -1)
+          if (WIFEXITED(last_child_status))
           {
-            perror("dup2");
-            close(pipefd[0]);
-            close(pipefd[1]);
-            _exit(EXIT_FAILURE);
+            exit_status = WEXITSTATUS(last_child_status);
           }
-          close(pipefd[0]);
-          close(pipefd[1]);
-
-          if (commands[1].output_file != NULL)
+          else if (WIFSIGNALED(last_child_status))
           {
-            int flags;
-
-            if (commands[1].append)
-            {
-              flags = O_WRONLY | O_CREAT | O_APPEND;
-            }
-            else
-            {
-              flags = O_WRONLY | O_CREAT | O_TRUNC;
-            }
-
-            int fd = open(commands[1].output_file, flags, 0640);
-
-            if (fd == -1)
-            {
-              perror("open");
-              _exit(EXIT_FAILURE);
-            }
-
-            if (dup2(fd, STDOUT_FILENO) == -1)
-            {
-              perror("dup2");
-              close(fd);
-              _exit(EXIT_FAILURE);
-            }
-            close(fd);
-          }
-
-          char *path = executable_search(commands[1].args[0]);
-          if (path == NULL)
-          {
-            fprintf(stderr, "command not found: %s\n", commands[1].args[0]);
-            _exit(EXIT_FAILURE);
-          }
-
-          execv(path, commands[1].args);
-
-          perror("execv");
-          free(path);
-          _exit(EXIT_FAILURE);
-        }
-        else
-        { // Parent Clean Up
-          close(pipefd[0]);
-          close(pipefd[1]);
-
-          int status1 = 0;
-          int status2 = 0;
-
-          pid_t result1;
-          pid_t result2;
-
-          do
-          {
-            result1 = waitpid(pid1, &status1, 0);
-          } while (result1 == -1 && errno == EINTR);
-          do
-          {
-            result2 = waitpid(pid2, &status2, 0);
-          } while (result2 == -1 && errno == EINTR);
-
-          if (result1 == -1 || result2 == -1)
-          {
-            perror("waitpid");
-            exit_status = EXIT_FAILURE;
-          }
-          else if (WIFEXITED(status2))
-          {
-            exit_status = WEXITSTATUS(status2);
-          }
-          else if (WIFSIGNALED(status2))
-          {
-            exit_status = WTERMSIG(status2);
+            *signal_number = WTERMSIG(last_child_status);
+            exit_status = 128 + *signal_number;
           }
           else
           {
             exit_status = EXIT_FAILURE;
           }
         }
+        if (pipeline_complete)
+        {
+          for (size_t i = 0; i < commands_count; i++)
+          {
+            if (strcmp(commands[i].args[0], "exit") == 0)
+            {
+              *should_exit = 1;
+              break;
+            }
+          }
+        }
+
+        free(pids);
+        free(pipefds);
       }
     }
   }
 
   if (exit_status == EXIT_SUCCESS && !has_pipe && current->argc > 0)
   {
-    if (strcmp(current->args[0], "cd") == 0) // cd
+    int is_builtin =
+        strcmp(current->args[0], "cd") == 0 ||
+        strcmp(current->args[0], "pwd") == 0 ||
+        strcmp(current->args[0], "which") == 0 ||
+        strcmp(current->args[0], "exit") == 0;
+
+    if (is_builtin)
     {
-      if (current->argc > 2)
+      int saved_stdout = -1;
+      int saved_stdin = -1;
+      int ready = 1;
+      if (current->output_file != NULL && ready)
       {
-        char msg[] = "cd: Too many arguments\n";
-        write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        exit_status = EXIT_FAILURE;
-      }
-      else if (current->argc == 1)
-      {
-        char *home = getenv("HOME");
-        if (home == NULL)
+        saved_stdout = dup(STDOUT_FILENO);
+
+        if (saved_stdout == -1)
         {
-          char msg[] = "cd: No HOME environment set\n";
-          write(STDERR_FILENO, msg, sizeof(msg) - 1);
+          perror("dup");
+          ready = 0;
           exit_status = EXIT_FAILURE;
         }
-        else if (chdir(home) == -1)
+
+        if (ready)
         {
-          perror("cd");
+          int flags;
+          if (current->append)
+          {
+            flags = O_WRONLY | O_CREAT | O_APPEND;
+          }
+          else
+          {
+            flags = O_WRONLY | O_CREAT | O_TRUNC;
+          }
+          int fd = open(current->output_file, flags, 0640);
+          if (fd == -1)
+          {
+            perror("open");
+            ready = 0;
+            exit_status = EXIT_FAILURE;
+          }
+          else
+          {
+            if (dup2(fd, STDOUT_FILENO) == -1)
+            {
+              perror("dup2");
+              ready = 0;
+              exit_status = EXIT_FAILURE;
+            }
+            close(fd);
+          }
+        }
+      }
+      if (ready && current->input_file != NULL)
+      {
+        saved_stdin = dup(STDIN_FILENO);
+        if (saved_stdin == -1)
+        {
+          perror("dup");
+          ready = 0;
           exit_status = EXIT_FAILURE;
         }
-      }
-      else
-      {
-        if (chdir(current->args[1]) == -1)
+        if (ready)
         {
-          perror("cd");
+          int fd = open(current->input_file, O_RDONLY);
+          if (fd == -1)
+          {
+            perror("open");
+            ready = 0;
+            exit_status = EXIT_FAILURE;
+          }
+          else
+          {
+            if (dup2(fd, STDIN_FILENO) == -1)
+            {
+              perror("dup2");
+              ready = 0;
+              exit_status = EXIT_FAILURE;
+            }
+            close(fd);
+          }
+        }
+      }
+
+      if (ready)
+      {
+        exit_status = execute_builtin(current, should_exit);
+      }
+
+      if (saved_stdout != -1)
+      {
+        if (dup2(saved_stdout, STDOUT_FILENO) == -1)
+        {
+          perror("dup2");
           exit_status = EXIT_FAILURE;
         }
+        close(saved_stdout);
       }
-    }
-    else if (strcmp(current->args[0], "pwd") == 0) // pwd
-    {
-      char *cwd = get_current_dir();
-      if (cwd == NULL)
+      if (saved_stdin != -1)
       {
-        perror("pwd");
-        exit_status = EXIT_FAILURE;
-      }
-      else
-      {
-        write(STDOUT_FILENO, cwd, strlen(cwd));
-        write(STDOUT_FILENO, "\n", 1);
-        free(cwd);
-      }
-    }
-    else if (strcmp(current->args[0], "which") == 0) // which
-    {
-      if (current->argc > 2)
-      {
-        fprintf(stderr, "which: too many arguments\n");
-        exit_status = EXIT_FAILURE;
-      }
-      else if (current->argc < 2)
-      {
-        fprintf(stderr, "which: missing arguments\n");
-        exit_status = EXIT_FAILURE;
-      }
-      else
-      {
-        char *which_arg_path = executable_search(current->args[1]);
-        if (which_arg_path != NULL)
+        if (dup2(saved_stdin, STDIN_FILENO) == -1)
         {
-          write(STDOUT_FILENO, which_arg_path, strlen(which_arg_path));
-          write(STDOUT_FILENO, "\n", 1);
-          free(which_arg_path);
-        }
-        else
-        {
-          fprintf(stderr, "which: executable not found: %s\n",
-                  current->args[1]);
+          perror("dup2");
           exit_status = EXIT_FAILURE;
         }
-      }
-    }
-    else if (strcmp(current->args[0], "exit") == 0) // exit
-    {
-      if (current->argc > 1)
-      {
-        fprintf(stderr, "exit: Too many arguments.\n");
-        exit_status = EXIT_FAILURE;
-      }
-      else
-      {
-        *should_exit = 1;
+        close(saved_stdin);
       }
     }
     else
@@ -751,11 +836,12 @@ int process_command(char *command, int *should_exit)
             }
             fd = open(current->output_file, flags, 0640);
 
-            if (fd < 0)
+            if (fd == -1)
             {
               perror("open");
               _exit(EXIT_FAILURE);
             }
+
             if (dup2(fd, STDOUT_FILENO) == -1)
             {
               perror("dup2");
@@ -780,6 +866,22 @@ int process_command(char *command, int *should_exit)
             }
             close(fd);
           }
+          else if (batch_mode)
+          {
+            int dev_null = open("/dev/null", O_RDONLY);
+            if (dev_null == -1)
+            {
+              perror("open");
+              _exit(EXIT_FAILURE);
+            }
+            if (dup2(dev_null, STDIN_FILENO) == -1)
+            {
+              perror("dup2");
+              close(dev_null);
+              _exit(EXIT_FAILURE);
+            }
+            close(dev_null);
+          }
 
           execv(executable, current->args);
           perror("execv");
@@ -791,7 +893,7 @@ int process_command(char *command, int *should_exit)
           int status;
           pid_t result = waitpid(c, &status, 0);
 
-          // Retry if signal occurred while system call wass in progress
+          // Retry if signal occurred while system call was in progress
           while (result == -1 && errno == EINTR)
           {
             result = waitpid(c, &status, 0);
@@ -808,7 +910,8 @@ int process_command(char *command, int *should_exit)
           }
           else if (WIFSIGNALED(status)) // Terminated by a Signal
           {
-            exit_status = WTERMSIG(status);
+            *signal_number = WTERMSIG(status);
+            exit_status = 128 + *signal_number;
           }
         }
         else // error
@@ -833,7 +936,7 @@ int process_command(char *command, int *should_exit)
 }
 
 char *get_current_dir(void)
-{ // {{{
+{
   size_t cwd_capacity = BUFSIZ;
   char *cwd = malloc(cwd_capacity);
   if (cwd == NULL)
@@ -868,7 +971,7 @@ char *get_current_dir(void)
 }
 
 char *executable_search(const char *exe)
-{ // {{{
+{
   const char *directories[] = {"/usr/local/bin", "/usr/bin", "/bin"};
 
   if (strchr(exe, '/') != NULL)
@@ -927,4 +1030,85 @@ char *executable_search(const char *exe)
     return NULL;
   }
   return NULL;
-} // }}}
+}
+
+int execute_builtin(Command *cmd, int *should_exit)
+{
+  if (strcmp(cmd->args[0], "pwd") == 0)
+  {
+    char *cwd = get_current_dir();
+    if (cwd == NULL)
+    {
+      perror("pwd");
+      return EXIT_FAILURE;
+    }
+    else
+    {
+      write(STDOUT_FILENO, cwd, strlen(cwd));
+      write(STDOUT_FILENO, "\n", 1);
+      free(cwd);
+      return EXIT_SUCCESS;
+    }
+  }
+
+  if (strcmp(cmd->args[0], "cd") == 0)
+  {
+    if (cmd->argc > 2)
+    {
+      fprintf(stderr, "cd: Too many args\n");
+      return EXIT_FAILURE;
+    }
+    const char *path = NULL;
+    if (cmd->argc == 1)
+    {
+      path = getenv("HOME");
+      if (path == NULL)
+      {
+        fprintf(stderr, "HOME env not set\n");
+        return EXIT_FAILURE;
+      }
+    }
+    else
+    {
+      path = cmd->args[1];
+    }
+    if (chdir(path) == -1)
+    {
+      perror("cd");
+      return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+  }
+
+  if (strcmp(cmd->args[0], "which") == 0)
+  {
+    if (cmd->argc < 2)
+    {
+      fprintf(stderr, "which: missing args\n");
+      return EXIT_FAILURE;
+    }
+    int status = EXIT_SUCCESS;
+    for (size_t i = 1; i < cmd->argc; i++)
+    {
+      char *path = executable_search(cmd->args[i]);
+      if (path == NULL)
+      {
+        fprintf(stderr, "which: executable not found: %s\n", cmd->args[i]);
+        status = EXIT_FAILURE;
+        continue;
+      }
+      write(STDOUT_FILENO, path, strlen(path));
+      write(STDOUT_FILENO, "\n", 1);
+      free(path);
+    }
+    return status;
+  }
+
+  if (strcmp(cmd->args[0], "exit") == 0)
+  {
+    *should_exit = 1;
+    return EXIT_SUCCESS;
+  }
+
+  return -1;
+}
